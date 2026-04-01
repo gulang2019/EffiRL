@@ -98,3 +98,53 @@ Implement three training algorithms:
  * `EffiAware Downsampling`: Upsampling, then downsampling by constructing a batch that maximimizes the goodput.
 
 Do normal GRPO training, every K steps, compute the `ground_truth` gradient on `V1`.
+
+## 8-GPU Policy Grid Workflow
+
+Use this when you want one policy per GPU (instead of only different seeds), plus gradient-policy grid search.
+
+### 1) Launch policies on 8 GPUs
+
+```bash
+./.venv/bin/python scripts/run_policy_grid_8gpu.py \
+  --run-root runs/policy_grid_8gpu \
+  --start-from-path runs/periodic_gradient_selector_100steps_w5_mult4_b2/window_002_resume_10_to_15/global_step_15 \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --arm-training-steps 100 \
+  --window-steps 5 \
+  --train-batch-size 2 \
+  --profile-window-multiplier 4 \
+  --profile-rollout-batch-size 2 \
+  --profile-max-new-tokens 4096 \
+  --gradient-keep-ratios 0.2,0.4,0.6,0.8,1.0 \
+  --launcher-env 'TRAINER_LOGGER=["console","tensorboard"]'
+```
+
+This writes:
+
+- `runs/policy_grid_8gpu/policy_grid_manifest.json`
+- per-policy run logs under `runs/policy_grid_8gpu/policies/*/launcher.log`
+
+### 2) Track progress across all policies
+
+```bash
+./.venv/bin/python scripts/track_policy_grid_progress.py \
+  --run-root runs/policy_grid_8gpu \
+  --watch-seconds 30
+```
+
+This reports and writes:
+
+- `runs/policy_grid_8gpu/progress/latest_status.csv`
+- `runs/policy_grid_8gpu/progress/step_metrics_long.csv`
+- `runs/policy_grid_8gpu/progress/family_step_summary.csv`
+
+Tracked metrics include train loss, validation accuracy (GSM8K/MATH), and response length (mean/std) vs step/time.
+
+### 3) Shutdown all policy-grid jobs
+
+```bash
+bash scripts/shutdown_policy_grid_8gpu.sh runs/policy_grid_8gpu
+```
+
+The shutdown script reads policy PIDs from `policy_grid_manifest.json` and sends `SIGTERM` to active jobs.
