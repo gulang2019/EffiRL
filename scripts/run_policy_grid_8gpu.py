@@ -444,7 +444,6 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(f"Missing train parquet: {path}")
 
-    start_step = parse_checkpoint_step(args.start_from_path)
     policies = build_policy_specs(args)
     gpu_ids = [x.strip() for x in args.gpu_ids.split(",") if x.strip()]
     if len(policies) > len(gpu_ids):
