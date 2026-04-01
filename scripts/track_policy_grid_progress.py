@@ -73,6 +73,29 @@ def parse_step_rows(log_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_periodic_rows(periodic_run_root: Path) -> list[dict[str, Any]]:
+    manifest_path = periodic_run_root / "periodic_gradient_selector_manifest.json"
+    if not manifest_path.exists():
+        return []
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rows: list[dict[str, Any]] = []
+    seen_steps: set[int] = set()
+    for window in manifest.get("windows", []):
+        log_path_raw = window.get("log_path")
+        if not log_path_raw:
+            continue
+        log_path = Path(log_path_raw)
+        window_rows = parse_step_rows(log_path)
+        for row in window_rows:
+            gs = row.get("training/global_step")
+            if isinstance(gs, int) and gs in seen_steps:
+                continue
+            if isinstance(gs, int):
+                seen_steps.add(gs)
+            rows.append(row)
+    return rows
+
+
 def pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -117,7 +140,12 @@ def summarize(args: argparse.Namespace) -> None:
         family = job["policy"]["family"]
         pid = int(job.get("pid", -1))
         log_path = Path(job["log_path"])
-        rows = parse_step_rows(log_path)
+        job_type = job.get("job_type", "static_selector")
+        if job_type == "periodic_gradient":
+            periodic_root = Path(job.get("periodic_run_root", ""))
+            rows = parse_periodic_rows(periodic_root)
+        else:
+            rows = parse_step_rows(log_path)
         latest = rows[-1] if rows else {}
         running = pid_is_running(pid)
 

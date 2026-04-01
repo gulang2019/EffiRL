@@ -50,6 +50,18 @@ def parse_args() -> argparse.Namespace:
         help="Required in scratch mode. Warmup run trains to this step before policy branching.",
     )
     parser.add_argument("--arm-training-steps", type=int, default=100)
+    parser.add_argument(
+        "--policy-launch-mode",
+        choices=["continuation", "fresh"],
+        default="continuation",
+        help="How policy arms are launched after selector dataset build.",
+    )
+    parser.add_argument(
+        "--gradient-update-mode",
+        choices=["static", "periodic"],
+        default="static",
+        help="static: one-shot selector pool; periodic: refresh gradient direction every window for gradient families.",
+    )
     parser.add_argument("--window-steps", type=int, default=5)
     parser.add_argument("--test-freq", type=int, default=25)
     parser.add_argument("--experiment-name", type=str, default="qwen2.5-1.5b-grpo-policy-grid")
@@ -271,6 +283,137 @@ def launch_job(
     return proc.pid
 
 
+def launch_fresh_job(
+    *,
+    args: argparse.Namespace,
+    gpu_id: str,
+    policy: PolicySpec,
+    selected_train_parquet: Path,
+    run_dir: Path,
+) -> int:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+    env["PYTHON_BIN"] = str(args.python_bin)
+    env["TRAIN_FILES"] = str([str(selected_train_parquet)])
+    env["RUN_DIR"] = str(run_dir)
+    env["EXPERIMENT_NAME"] = f"{args.experiment_name}-{policy.name}"
+    env["TOTAL_TRAINING_STEPS"] = str(args.arm_training_steps)
+    env["SAVE_FREQ"] = str(args.arm_training_steps)
+    env["TEST_FREQ"] = str(args.test_freq if 0 < args.test_freq <= args.arm_training_steps else args.arm_training_steps)
+    env["TRAINER_LOGGER"] = env.get("TRAINER_LOGGER", "[\"console\",\"tensorboard\"]")
+    env["TENSORBOARD_DIR"] = env.get("TENSORBOARD_DIR", str(run_dir / "tensorboard_log"))
+    env["TRAIN_BATCH_SIZE"] = env.get("TRAIN_BATCH_SIZE", str(args.train_batch_size))
+    env["PYTORCH_ALLOC_CONF"] = env.get("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    env.update(parse_env_overrides(args.launcher_env))
+
+    if args.dry_run:
+        rendered = "bash " + shlex.quote(str(args.base_launcher))
+        print(f"[dry-run] launch(fresh) policy={policy.name} gpu={gpu_id}: {rendered}")
+        return -1
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "launcher.log"
+    with log_path.open("w", encoding="utf-8") as handle:
+        handle.write(f"$ bash {args.base_launcher}\n\n")
+        handle.flush()
+        proc = subprocess.Popen(
+            ["bash", str(args.base_launcher)],
+            cwd=ROOT_DIR,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    return proc.pid
+
+
+def launch_periodic_job(
+    *,
+    args: argparse.Namespace,
+    gpu_id: str,
+    policy: PolicySpec,
+    start_checkpoint: Path,
+    start_step: int,
+    run_dir: Path,
+) -> int:
+    periodic_root = run_dir / "periodic"
+    target_total_steps = start_step + args.arm_training_steps
+    command = [
+        str(args.python_bin),
+        str(ROOT_DIR / "scripts" / "run_periodic_gradient_selector.py"),
+        "--run-root",
+        str(periodic_root),
+        "--experiment-name",
+        f"{args.experiment_name}-{policy.name}-periodic",
+        "--window-steps",
+        str(args.window_steps),
+        "--total-training-steps",
+        str(target_total_steps),
+        "--start-from-path",
+        str(start_checkpoint),
+        "--selector-metric",
+        policy.metric,
+        "--selector",
+        policy.selector,
+        "--profile-window-multiplier",
+        str(args.profile_window_multiplier),
+        "--profile-seed",
+        str(args.profile_seed),
+        "--profile-group-size",
+        str(args.profile_group_size),
+        "--profile-rollout-batch-size",
+        str(args.profile_rollout_batch_size),
+        "--profile-max-prompt-tokens",
+        str(args.profile_max_prompt_tokens),
+        "--profile-max-new-tokens",
+        str(args.profile_max_new_tokens),
+        "--profile-temperature",
+        str(args.profile_temperature),
+        "--profile-top-k",
+        str(args.profile_top_k),
+        "--profile-base-model",
+        str(args.profile_base_model),
+    ]
+    if policy.keep_count is not None:
+        command.extend(["--keep-count", str(policy.keep_count)])
+    else:
+        command.extend(["--keep-ratio", str(policy.keep_ratio if policy.keep_ratio is not None else 0.5)])
+
+    command.extend(["--launcher-env", f"TRAIN_BATCH_SIZE={args.train_batch_size}"])
+    command.extend(["--launcher-env", "TRAINER_LOGGER=[\"console\",\"tensorboard\"]"])
+    command.extend(["--launcher-env", f"TENSORBOARD_DIR={run_dir / 'tensorboard_log'}"])
+    command.extend(["--launcher-env", "PYTORCH_ALLOC_CONF=expandable_segments:True"])
+    for item in args.launcher_env:
+        command.extend(["--launcher-env", item])
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = gpu_id
+    env["PYTHON_BIN"] = str(args.python_bin)
+    env["PYTORCH_ALLOC_CONF"] = env.get("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    if args.dry_run:
+        rendered = " ".join(shlex.quote(x) for x in command)
+        print(f"[dry-run] launch(periodic) policy={policy.name} gpu={gpu_id}: {rendered}")
+        return -1
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = run_dir / "launcher.log"
+    with log_path.open("w", encoding="utf-8") as handle:
+        handle.write(f"$ {' '.join(shlex.quote(x) for x in command)}\n\n")
+        handle.flush()
+        proc = subprocess.Popen(
+            command,
+            cwd=ROOT_DIR,
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    return proc.pid
+
+
 def main() -> None:
     args = parse_args()
     if args.mode == "continuation":
@@ -283,8 +426,16 @@ def main() -> None:
             raise ValueError("--checkpoint-step is required in scratch mode.")
         if args.checkpoint_step <= 0:
             raise ValueError("--checkpoint-step must be positive.")
-    if not args.continuation_launcher.exists():
-        raise FileNotFoundError(f"Missing continuation launcher: {args.continuation_launcher}")
+    if args.policy_launch_mode == "continuation" and not args.continuation_launcher.exists():
+        raise FileNotFoundError(
+            f"Missing continuation launcher: {args.continuation_launcher}. "
+            "Use --policy-launch-mode fresh to avoid this dependency."
+        )
+    if args.gradient_update_mode == "periodic" and not args.continuation_launcher.exists():
+        raise FileNotFoundError(
+            f"Missing continuation launcher: {args.continuation_launcher}. "
+            "Periodic gradient refresh requires continuation windows."
+        )
     if not args.base_launcher.exists():
         raise FileNotFoundError(f"Missing base launcher: {args.base_launcher}")
     if not args.python_bin.exists():
@@ -334,47 +485,80 @@ def main() -> None:
     selector_pool_dir = args.run_root / "selector_pools"
     selector_pool_dir.mkdir(parents=True, exist_ok=True)
 
-    profile_dir = args.run_root / "profile"
-    v1_size, v2_size = effective_profile_sizes(args.train_batch_size, args.window_steps, args.profile_window_multiplier)
-    profile_cmd = [
-        str(args.python_bin),
-        str(ROOT_DIR / "scripts" / "profile_grpo_ground_truth.py"),
-        "--checkpoint-dir",
-        str(start_checkpoint.parent),
-        "--checkpoint-steps",
-        str(start_step),
-        "--output-dir",
-        str(profile_dir),
-        "--seed",
-        str(args.profile_seed),
-        "--v1-size",
-        str(v1_size),
-        "--v2-size",
-        str(v2_size),
-        "--group-size",
-        str(args.profile_group_size),
-        "--rollout-batch-size",
-        str(args.profile_rollout_batch_size),
-        "--max-prompt-tokens",
-        str(args.profile_max_prompt_tokens),
-        "--max-new-tokens",
-        str(args.profile_max_new_tokens),
-        "--temperature",
-        str(args.profile_temperature),
-        "--top-k",
-        str(args.profile_top_k),
-        "--base-model",
-        args.profile_base_model,
-        "--data-files",
-        *[str(path) for path in args.train_parquets],
-    ]
-    if args.exclude_files:
-        profile_cmd.extend(["--exclude-files", *[str(path) for path in args.exclude_files]])
+    static_policies: list[PolicySpec] = []
+    periodic_gradient_policies: list[PolicySpec] = []
+    for policy in policies:
+        if args.gradient_update_mode == "periodic" and policy.family.startswith("gradient"):
+            periodic_gradient_policies.append(policy)
+        else:
+            static_policies.append(policy)
 
-    run_cmd(profile_cmd, env=os.environ.copy(), log_path=args.run_root / "profile.log", dry_run=args.dry_run)
+    v1_size, v2_size = effective_profile_sizes(args.train_batch_size, args.window_steps, args.profile_window_multiplier)
+    profile_dir = args.run_root / "profile"
+    if static_policies:
+        profile_cmd = [
+            str(args.python_bin),
+            str(ROOT_DIR / "scripts" / "profile_grpo_ground_truth.py"),
+            "--checkpoint-dir",
+            str(start_checkpoint.parent),
+            "--checkpoint-steps",
+            str(start_step),
+            "--output-dir",
+            str(profile_dir),
+            "--seed",
+            str(args.profile_seed),
+            "--v1-size",
+            str(v1_size),
+            "--v2-size",
+            str(v2_size),
+            "--group-size",
+            str(args.profile_group_size),
+            "--rollout-batch-size",
+            str(args.profile_rollout_batch_size),
+            "--max-prompt-tokens",
+            str(args.profile_max_prompt_tokens),
+            "--max-new-tokens",
+            str(args.profile_max_new_tokens),
+            "--temperature",
+            str(args.profile_temperature),
+            "--top-k",
+            str(args.profile_top_k),
+            "--base-model",
+            args.profile_base_model,
+            "--data-files",
+            *[str(path) for path in args.train_parquets],
+        ]
+        if args.exclude_files:
+            profile_cmd.extend(["--exclude-files", *[str(path) for path in args.exclude_files]])
+        run_cmd(profile_cmd, env=os.environ.copy(), log_path=args.run_root / "profile.log", dry_run=args.dry_run)
 
     jobs: list[dict[str, object]] = []
     for idx, policy in enumerate(policies):
+        if policy in periodic_gradient_policies:
+            gpu_id = gpu_ids[idx]
+            run_dir = args.run_root / "policies" / policy.name
+            pid = launch_periodic_job(
+                args=args,
+                gpu_id=gpu_id,
+                policy=policy,
+                start_checkpoint=start_checkpoint,
+                start_step=start_step,
+                run_dir=run_dir,
+            )
+            jobs.append(
+                {
+                    "policy": asdict(policy),
+                    "job_type": "periodic_gradient",
+                    "gpu_id": gpu_id,
+                    "pid": pid,
+                    "run_dir": str(run_dir),
+                    "log_path": str(run_dir / "launcher.log"),
+                    "periodic_run_root": str(run_dir / "periodic"),
+                    "tensorboard_dir": str(run_dir / "tensorboard_log"),
+                }
+            )
+            continue
+
         keep_args: list[str]
         if policy.keep_count is not None:
             keep_args = ["--keep-count", str(policy.keep_count)]
@@ -415,18 +599,28 @@ def main() -> None:
 
         gpu_id = gpu_ids[idx]
         run_dir = args.run_root / "policies" / policy.name
-        pid = launch_job(
-            args=args,
-            gpu_id=gpu_id,
-            policy=policy,
-            start_checkpoint=start_checkpoint,
-            start_step=start_step,
-            selected_train_parquet=selected_train,
-            run_dir=run_dir,
-        )
+        if args.policy_launch_mode == "continuation":
+            pid = launch_job(
+                args=args,
+                gpu_id=gpu_id,
+                policy=policy,
+                start_checkpoint=start_checkpoint,
+                start_step=start_step,
+                selected_train_parquet=selected_train,
+                run_dir=run_dir,
+            )
+        else:
+            pid = launch_fresh_job(
+                args=args,
+                gpu_id=gpu_id,
+                policy=policy,
+                selected_train_parquet=selected_train,
+                run_dir=run_dir,
+            )
         jobs.append(
             {
                 "policy": asdict(policy),
+                "job_type": "static_selector",
                 "gpu_id": gpu_id,
                 "pid": pid,
                 "run_dir": str(run_dir),
@@ -440,6 +634,8 @@ def main() -> None:
     manifest = {
         "run_root": str(args.run_root),
         "mode": args.mode,
+        "policy_launch_mode": args.policy_launch_mode,
+        "gradient_update_mode": args.gradient_update_mode,
         "start_from_path": str(start_checkpoint),
         "start_step": start_step,
         "arm_training_steps": args.arm_training_steps,

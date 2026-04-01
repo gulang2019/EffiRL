@@ -148,3 +148,60 @@ bash scripts/shutdown_policy_grid_8gpu.sh runs/policy_grid_8gpu
 ```
 
 The shutdown script reads policy PIDs from `policy_grid_manifest.json` and sends `SIGTERM` to active jobs.
+
+### Current Pseudocode (Policy Grid + Periodic Gradient Refresh)
+
+```text
+Inputs:
+  mode ∈ {continuation, scratch}
+  policy_launch_mode ∈ {continuation, fresh}
+  gradient_update_mode ∈ {static, periodic}
+  gpu_ids = [g0, g1, ..., gN]
+  policies = [dapo_top, pods_top, random, gradient_top_r020, ...]
+
+1) Resolve start checkpoint:
+  if mode == continuation:
+    start_ckpt = --start-from-path (global_step_K)
+  else if mode == scratch:
+    run warmup training to --checkpoint-step = K
+    start_ckpt = warmup/global_step_K
+
+2) Split policies:
+  if gradient_update_mode == periodic:
+    periodic_policies = {p | p.family startswith "gradient"}
+    static_policies   = policies - periodic_policies
+  else:
+    periodic_policies = {}
+    static_policies   = policies
+
+3) Build static selector pool once (only if static_policies non-empty):
+  profile start_ckpt on V1/V2
+  for each p in static_policies:
+    selected_train[p] = build_profile_selector_dataset(
+      metric=p.metric, selector=p.selector, keep_ratio/keep_count
+    )
+
+4) Launch one policy per GPU (index aligned):
+  for i, p in enumerate(policies):
+    gpu = gpu_ids[i]
+    if p in periodic_policies:
+      launch run_periodic_gradient_selector.py on gpu with:
+        --start-from-path start_ckpt
+        --window-steps W
+        --total-training-steps K + arm_training_steps
+        --selector-metric p.metric
+        --selector p.selector
+        --keep-ratio/--keep-count from p
+      # gradient direction refreshes every window
+    else:
+      if policy_launch_mode == continuation:
+        branch start_ckpt -> policy run dir
+        launch continuation launcher on selected_train[p]
+      else:
+        launch base launcher (fresh) on selected_train[p]
+
+5) Write policy_grid_manifest.json:
+  store per-policy:
+    policy, gpu_id, pid, run_dir, log_path, tensorboard_dir
+    job_type ∈ {static_selector, periodic_gradient}
+```
