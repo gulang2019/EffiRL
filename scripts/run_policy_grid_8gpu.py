@@ -163,7 +163,21 @@ def run_cmd(command: list[str], *, env: Dict[str, str], log_path: Path | None, d
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write(f"$ {rendered}\n\n")
         handle.flush()
-        subprocess.run(command, cwd=ROOT_DIR, env=env, check=True, stdout=handle, stderr=subprocess.STDOUT, text=True)
+        try:
+            subprocess.run(command, cwd=ROOT_DIR, env=env, check=True, stdout=handle, stderr=subprocess.STDOUT, text=True)
+        except subprocess.CalledProcessError as exc:
+            tail_text = ""
+            try:
+                tail_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:]
+                tail_text = "\n".join(tail_lines)
+            except Exception:
+                tail_text = "<failed to read log tail>"
+            raise RuntimeError(
+                f"Command failed with exit code {exc.returncode}\n"
+                f"log_path: {log_path}\n"
+                f"command: {rendered}\n"
+                f"--- log tail ---\n{tail_text}"
+            ) from exc
 
 
 def effective_test_freq(total_steps: int, requested: int) -> int:
