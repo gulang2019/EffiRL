@@ -1,5 +1,173 @@
 # EffiRL
 
+## Quickstart (Clean Repro Setup)
+
+### 1) Clone + build a dedicated environment
+
+Use a separate env for this project (recommended).
+
+```bash
+git clone git@github.com:gulang2019/EffiRL.git
+cd EffiRL
+git submodule update --init --recursive
+
+python3 -m venv .venv_effirl
+source .venv_effirl/bin/activate
+python -m pip install --upgrade pip wheel "setuptools<81"
+```
+
+Install core dependencies:
+
+```bash
+pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+pip install \
+  ray==2.54.1 \
+  tensordict==0.11.0 \
+  transformers==4.57.6 \
+  vllm==0.12.0 \
+  peft>=0.12.0 \
+  omegaconf>=2.3.0 \
+  accelerate>=0.34.0 \
+  datasets>=2.20.0 \
+  pyarrow>=17.0.0 \
+  pandas>=2.2.0 \
+  numpy>=1.26.0 \
+  scipy>=1.11.0 \
+  matplotlib>=3.8.0 \
+  pyyaml \
+  tensorboard==2.20.0
+pip install --no-deps -e thirdparty/verl
+```
+
+Optional (if your host supports it): install `flash_attn`
+
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+If `flash_attn` is unavailable on your host, run launchers with:
+
+```bash
+--launcher-env USE_REMOVE_PADDING=false
+```
+
+Alternative: one-command bootstrap:
+
+```bash
+bash scripts/bootstrap_effirl_8xa100.sh /path/to/workspace
+# optional: INSTALL_FLASH_ATTN=1 bash scripts/bootstrap_effirl_8xa100.sh /path/to/workspace
+```
+
+### 2) Prepare data
+
+```bash
+bash scripts/prepare_verl_math_data.sh
+./.venv_effirl/bin/python scripts/make_val_subset.py \
+  --output data/verl/validation_500.parquet \
+  --size 500 \
+  data/verl/gsm8k/test.parquet \
+  data/verl/math/test.parquet
+```
+
+### 3) Run policy-grid training (apple-to-apple)
+
+Continuation from an existing checkpoint:
+
+```bash
+./.venv_effirl/bin/python scripts/run_policy_grid_8gpu.py \
+  --run-root runs/policy_grid_8gpu \
+  --mode continuation \
+  --start-from-path <path_to_global_step_x> \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --arm-training-steps 100 \
+  --window-steps 5 \
+  --gradient-update-mode periodic \
+  --profile-window-multiplier 4 \
+  --gradient-keep-ratios 0.2,0.4,0.6,0.8,1.0 \
+  --launcher-env 'TRAINER_LOGGER=["console","tensorboard"]' \
+  --launcher-env USE_REMOVE_PADDING=false
+```
+
+Scratch start (warmup first):
+
+```bash
+./.venv_effirl/bin/python scripts/run_policy_grid_8gpu.py \
+  --run-root runs/policy_grid_8gpu \
+  --mode scratch \
+  --checkpoint-step 15 \
+  --gpu-ids 0,1,2,3,4,5,6,7
+```
+
+Notes for detailed per-step analysis:
+
+- Policy launcher now saves checkpoints at `window_steps` cadence, so step-wise rollouts can be reconstructed.
+- Gradient policies with `--gradient-update-mode periodic` refresh gradient direction each window.
+
+### 4) Track progress + generate report bundle
+
+Live tracking:
+
+```bash
+./.venv_effirl/bin/python scripts/track_policy_grid_progress.py \
+  --run-root runs/policy_grid_8gpu \
+  --watch-seconds 30
+```
+
+Generate curves:
+
+```bash
+./.venv_effirl/bin/python scripts/plot_policy_grid_curves.py \
+  --run-root runs/policy_grid_8gpu \
+  --metrics actor_loss,gsm8k_acc,math_acc,response_length_mean \
+  --smooth 0.2
+```
+
+Generate aggregate deltas:
+
+```bash
+./.venv_effirl/bin/python scripts/export_policy_learning_delta.py \
+  --run-root runs/policy_grid_8gpu
+```
+
+Detailed per-checkpoint rollout snapshots (for qualitative comparisons):
+
+```bash
+./.venv_effirl/bin/python scripts/collect_policy_rollout_snapshots.py \
+  --run-root runs/policy_grid_8gpu \
+  --eval-files data/verl/validation_500.parquet \
+  --eval-limit 200 \
+  --max-new-tokens 512 \
+  --max-checkpoints-per-policy 5
+```
+
+One-command report bundle (curves + deltas + selected-data overlap + optional rollouts):
+
+```bash
+./.venv_effirl/bin/python scripts/build_policy_grid_report.py \
+  --run-root runs/policy_grid_8gpu \
+  --collect-rollouts \
+  --rollout-eval-files data/verl/validation_500.parquet \
+  --rollout-eval-limit 200
+```
+
+### 5) Compare newly solved examples between two checkpoints
+
+```bash
+./.venv_effirl/bin/python scripts/report_newly_solved_examples.py \
+  --start-step-dir <run>/global_step_15 \
+  --end-step-dir <run>/global_step_100 \
+  --train-files data/verl/gsm8k/train.parquet data/verl/math/train.parquet \
+  --val-files data/verl/validation_500.parquet \
+  --max-new-tokens 1024 \
+  --output-dir runs/analysis/newly_solved_step15_to_100
+```
+
+This exports:
+
+- per-example solved transitions (`newly_solved`, `forgotten`)
+- start/end rollout text
+- split/source summaries
+
 **Background** 
 
 * It is well studied that online data selection matters for training performance, but less discusses the compute efficiency of data selection. 
@@ -205,3 +373,120 @@ Inputs:
     policy, gpu_id, pid, run_dir, log_path, tensorboard_dir
     job_type ∈ {static_selector, periodic_gradient}
 ```
+
+## Download-Only Tracking Data (rsync)
+
+### Minimal progress-only sync (no env/model/checkpoints)
+
+```bash
+rsync -avz --progress \
+  --exclude='.venv/' \
+  --exclude='thirdparty/' \
+  --exclude='checkpoints/' \
+  --exclude='**/global_step_*/' \
+  --exclude='**/actor/' \
+  --exclude='**/optimizer/' \
+  --exclude='**/hf_model/' \
+  --exclude='**/tensorboard_log/' \
+  --exclude='outputs/' \
+  --exclude='analysis/' \
+  --include='runs/**/policy_grid_manifest.json' \
+  --include='runs/**/periodic_gradient_selector_manifest.json' \
+  --include='runs/**/launcher.log' \
+  --include='runs/**/profile.log' \
+  --include='runs/**/progress/*.csv' \
+  --include='runs/**/selector_pools/**/*.csv' \
+  --include='runs/**/selector_pools/**/*.json' \
+  --include='runs/**/profile/**/*.csv' \
+  --include='runs/**/profile/**/*.json' \
+  --include='scripts/*.py' \
+  --include='README.md' \
+  --exclude='*' \
+  siyuanch@CATALYST-FLEET.PC.CS.CMU.EDU:/path/to/EffiRL/ \
+  ./EffiRL_progress_only/
+```
+
+### Rollout-aware sync (for richer analysis)
+
+Use this if you also want rollout artifacts and detailed delta reports generated on the server.
+
+```bash
+rsync -avz --progress \
+  --exclude='.venv/' \
+  --exclude='thirdparty/' \
+  --exclude='checkpoints/' \
+  --exclude='**/global_step_*/' \
+  --exclude='**/actor/' \
+  --exclude='**/optimizer/' \
+  --exclude='**/hf_model/' \
+  --exclude='**/tensorboard_log/' \
+  --exclude='outputs/' \
+  --include='runs/**/policy_grid_manifest.json' \
+  --include='runs/**/periodic_gradient_selector_manifest.json' \
+  --include='runs/**/launcher.log' \
+  --include='runs/**/profile.log' \
+  --include='runs/**/progress/*.csv' \
+  --include='runs/**/selector_pools/**/*.csv' \
+  --include='runs/**/selector_pools/**/*.json' \
+  --include='runs/**/profile/rollout_details.csv' \
+  --include='runs/**/profile/ground_truth_profile.csv' \
+  --include='runs/**/profile/**/*.json' \
+  --include='runs/**/analysis/*.csv' \
+  --include='runs/**/analysis/*.json' \
+  --include='scripts/*.py' \
+  --include='README.md' \
+  --exclude='*' \
+  siyuanch@CATALYST-FLEET.PC.CS.CMU.EDU:/path/to/EffiRL/ \
+  ./EffiRL_rollout_tracking/
+```
+
+## Progress + Learned-Delta Reports
+
+### A) Keep track of training progress
+
+```bash
+./.venv/bin/python scripts/track_policy_grid_progress.py \
+  --run-root runs/policy_grid_8gpu \
+  --watch-seconds 30
+```
+
+Useful outputs:
+
+- `runs/policy_grid_8gpu/progress/latest_status.csv`
+- `runs/policy_grid_8gpu/progress/step_metrics_long.csv`
+- `runs/policy_grid_8gpu/progress/family_step_summary.csv`
+
+### B) Aggregate learned delta (per policy/family)
+
+```bash
+./.venv/bin/python scripts/export_policy_learning_delta.py \
+  --run-root runs/policy_grid_8gpu
+```
+
+Outputs:
+
+- `runs/policy_grid_8gpu/analysis/per_run_specs.json`
+- `runs/policy_grid_8gpu/analysis/per_run_delta.csv`
+- `runs/policy_grid_8gpu/analysis/family_delta_summary.csv`
+
+### C) Detailed examples: newly solved / forgotten (train + validation)
+
+This compares two checkpoints and reports per-example changes.
+
+```bash
+./.venv/bin/python scripts/report_newly_solved_examples.py \
+  --start-step-dir <run>/global_step_15 \
+  --end-step-dir <run>/global_step_100 \
+  --train-files data/verl/gsm8k/train.parquet data/verl/math/train.parquet \
+  --val-files data/verl/validation_500.parquet \
+  --max-new-tokens 1024 \
+  --output-dir runs/analysis/newly_solved_step15_to_100
+```
+
+Detailed outputs:
+
+- `delta_per_example.csv` (start/end solved + delta per problem)
+- `newly_solved_examples.csv`
+- `summary_by_split_source.csv`
+- `start_predictions.csv`
+- `end_predictions.csv`

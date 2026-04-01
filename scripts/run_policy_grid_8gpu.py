@@ -186,6 +186,14 @@ def effective_test_freq(total_steps: int, requested: int) -> int:
     return requested
 
 
+def effective_save_freq(total_steps: int, requested: int) -> int:
+    if requested <= 0:
+        return total_steps
+    if requested > total_steps:
+        return total_steps
+    return requested
+
+
 def build_policy_specs(args: argparse.Namespace) -> list[PolicySpec]:
     specs: list[PolicySpec] = []
     if args.include_baselines:
@@ -267,7 +275,7 @@ def launch_job(
     env["RUN_DIR"] = str(run_dir)
     env["EXPERIMENT_NAME"] = f"{args.experiment_name}-{policy.name}"
     env["EXTRA_TRAINING_STEPS"] = str(args.arm_training_steps)
-    env["SAVE_FREQ"] = str(args.arm_training_steps)
+    env["SAVE_FREQ"] = str(effective_save_freq(args.arm_training_steps, args.window_steps))
     env["TEST_FREQ"] = str(args.test_freq if 0 < args.test_freq <= args.arm_training_steps else args.arm_training_steps)
     env["TRAINER_LOGGER"] = env.get("TRAINER_LOGGER", "[\"console\",\"tensorboard\"]")
     env["TENSORBOARD_DIR"] = env.get("TENSORBOARD_DIR", str(run_dir / "tensorboard_log"))
@@ -312,7 +320,7 @@ def launch_fresh_job(
     env["RUN_DIR"] = str(run_dir)
     env["EXPERIMENT_NAME"] = f"{args.experiment_name}-{policy.name}"
     env["TOTAL_TRAINING_STEPS"] = str(args.arm_training_steps)
-    env["SAVE_FREQ"] = str(args.arm_training_steps)
+    env["SAVE_FREQ"] = str(effective_save_freq(args.arm_training_steps, args.window_steps))
     env["TEST_FREQ"] = str(args.test_freq if 0 < args.test_freq <= args.arm_training_steps else args.arm_training_steps)
     env["TRAINER_LOGGER"] = env.get("TRAINER_LOGGER", "[\"console\",\"tensorboard\"]")
     env["TENSORBOARD_DIR"] = env.get("TENSORBOARD_DIR", str(run_dir / "tensorboard_log"))

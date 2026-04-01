@@ -57,6 +57,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-${MAX_MODEL_LEN}}"
 AGENT_NUM_WORKERS="${AGENT_NUM_WORKERS:-1}"
 MODEL_USE_SHM="${MODEL_USE_SHM:-true}"
+USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-true}"
 ROLLOUT_ENABLE_SLEEP_MODE="${ROLLOUT_ENABLE_SLEEP_MODE:-true}"
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-true}"
 ROLLOUT_LAYERED_SUMMON="${ROLLOUT_LAYERED_SUMMON:-true}"
@@ -106,7 +107,7 @@ fi
   actor_rollout_ref.model.lora_alpha=32 \
   actor_rollout_ref.model.target_modules=all-linear \
   +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
-  actor_rollout_ref.model.use_remove_padding=True \
+  actor_rollout_ref.model.use_remove_padding="${USE_REMOVE_PADDING}" \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
   actor_rollout_ref.actor.optim.lr="${ACTOR_LR}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
