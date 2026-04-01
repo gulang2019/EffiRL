@@ -1,0 +1,3 @@
+[submodule "thirdparty/verl"]
+	path = thirdparty/verl
+	url = https://github.com/volcengine/verl
