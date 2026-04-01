@@ -36,12 +36,29 @@ def default_python_bin() -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--start-from-path", type=Path, required=True, help="global_step_* checkpoint directory.")
+    parser.add_argument(
+        "--mode",
+        choices=["continuation", "scratch"],
+        default="continuation",
+        help="continuation: branch from --start-from-path; scratch: run warmup to --checkpoint-step first.",
+    )
+    parser.add_argument("--start-from-path", type=Path, default=None, help="global_step_* checkpoint directory.")
+    parser.add_argument(
+        "--checkpoint-step",
+        type=int,
+        default=None,
+        help="Required in scratch mode. Warmup run trains to this step before policy branching.",
+    )
     parser.add_argument("--arm-training-steps", type=int, default=100)
     parser.add_argument("--window-steps", type=int, default=5)
     parser.add_argument("--test-freq", type=int, default=25)
     parser.add_argument("--experiment-name", type=str, default="qwen2.5-1.5b-grpo-policy-grid")
     parser.add_argument("--python-bin", type=Path, default=default_python_bin())
+    parser.add_argument(
+        "--base-launcher",
+        type=Path,
+        default=ROOT_DIR / "scripts" / "run_verl_math_1p5b_single_gpu_vllm.sh",
+    )
     parser.add_argument(
         "--continuation-launcher",
         type=Path,
@@ -70,6 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-temperature", type=float, default=1.0)
     parser.add_argument("--profile-top-k", type=int, default=0)
     parser.add_argument("--profile-base-model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    parser.add_argument("--warmup-gpu-id", type=str, default=None, help="GPU id used for scratch warmup run.")
     parser.add_argument("--include-baselines", action="store_true", default=True)
     parser.add_argument(
         "--gradient-keep-ratios",
@@ -134,6 +152,12 @@ def run_cmd(command: list[str], *, env: Dict[str, str], log_path: Path | None, d
         handle.write(f"$ {rendered}\n\n")
         handle.flush()
         subprocess.run(command, cwd=ROOT_DIR, env=env, check=True, stdout=handle, stderr=subprocess.STDOUT, text=True)
+
+
+def effective_test_freq(total_steps: int, requested: int) -> int:
+    if requested <= 0 or requested > total_steps or total_steps % requested != 0:
+        return total_steps
+    return requested
 
 
 def build_policy_specs(args: argparse.Namespace) -> list[PolicySpec]:
@@ -249,10 +273,20 @@ def launch_job(
 
 def main() -> None:
     args = parse_args()
-    if not args.start_from_path.exists():
-        raise FileNotFoundError(f"Missing start checkpoint: {args.start_from_path}")
+    if args.mode == "continuation":
+        if args.start_from_path is None:
+            raise ValueError("--start-from-path is required in continuation mode.")
+        if not args.start_from_path.exists():
+            raise FileNotFoundError(f"Missing start checkpoint: {args.start_from_path}")
+    else:
+        if args.checkpoint_step is None:
+            raise ValueError("--checkpoint-step is required in scratch mode.")
+        if args.checkpoint_step <= 0:
+            raise ValueError("--checkpoint-step must be positive.")
     if not args.continuation_launcher.exists():
         raise FileNotFoundError(f"Missing continuation launcher: {args.continuation_launcher}")
+    if not args.base_launcher.exists():
+        raise FileNotFoundError(f"Missing base launcher: {args.base_launcher}")
     if not args.python_bin.exists():
         raise FileNotFoundError(f"Missing python binary: {args.python_bin}")
     for path in args.train_parquets:
@@ -264,6 +298,37 @@ def main() -> None:
     gpu_ids = [x.strip() for x in args.gpu_ids.split(",") if x.strip()]
     if len(policies) > len(gpu_ids):
         raise ValueError(f"Need >= {len(policies)} GPUs for one-policy-per-GPU, got {len(gpu_ids)}")
+    if not gpu_ids:
+        raise ValueError("--gpu-ids must not be empty.")
+
+    if args.mode == "continuation":
+        assert args.start_from_path is not None
+        start_checkpoint = args.start_from_path
+        start_step = parse_checkpoint_step(start_checkpoint)
+    else:
+        warmup_gpu = args.warmup_gpu_id or gpu_ids[0]
+        warmup_dir = args.run_root / "warmup"
+        env = os.environ.copy()
+        env["PYTHON_BIN"] = str(args.python_bin)
+        env["CUDA_VISIBLE_DEVICES"] = warmup_gpu
+        env["TRAIN_FILES"] = str([str(path) for path in args.train_parquets])
+        env["RUN_DIR"] = str(warmup_dir)
+        env["EXPERIMENT_NAME"] = f"{args.experiment_name}-warmup"
+        env["TOTAL_TRAINING_STEPS"] = str(args.checkpoint_step)
+        env["SAVE_FREQ"] = str(args.checkpoint_step)
+        env["TEST_FREQ"] = str(effective_test_freq(args.checkpoint_step, args.test_freq))
+        env["TRAINER_LOGGER"] = env.get("TRAINER_LOGGER", "[\"console\",\"tensorboard\"]")
+        env["TENSORBOARD_DIR"] = env.get("TENSORBOARD_DIR", str(warmup_dir / "tensorboard_log"))
+        env["TRAIN_BATCH_SIZE"] = env.get("TRAIN_BATCH_SIZE", str(args.train_batch_size))
+        env.update(parse_env_overrides(args.launcher_env))
+        run_cmd(
+            ["bash", str(args.base_launcher)],
+            env=env,
+            log_path=warmup_dir / "launcher.log",
+            dry_run=args.dry_run,
+        )
+        start_step = int(args.checkpoint_step)
+        start_checkpoint = warmup_dir / f"global_step_{start_step}"
 
     args.run_root.mkdir(parents=True, exist_ok=True)
     selector_pool_dir = args.run_root / "selector_pools"
@@ -275,7 +340,7 @@ def main() -> None:
         str(args.python_bin),
         str(ROOT_DIR / "scripts" / "profile_grpo_ground_truth.py"),
         "--checkpoint-dir",
-        str(args.start_from_path.parent),
+        str(start_checkpoint.parent),
         "--checkpoint-steps",
         str(start_step),
         "--output-dir",
@@ -354,7 +419,7 @@ def main() -> None:
             args=args,
             gpu_id=gpu_id,
             policy=policy,
-            start_checkpoint=args.start_from_path,
+            start_checkpoint=start_checkpoint,
             start_step=start_step,
             selected_train_parquet=selected_train,
             run_dir=run_dir,
@@ -374,7 +439,8 @@ def main() -> None:
 
     manifest = {
         "run_root": str(args.run_root),
-        "start_from_path": str(args.start_from_path),
+        "mode": args.mode,
+        "start_from_path": str(start_checkpoint),
         "start_step": start_step,
         "arm_training_steps": args.arm_training_steps,
         "profile": {
