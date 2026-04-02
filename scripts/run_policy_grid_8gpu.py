@@ -102,6 +102,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-gpu-id", type=str, default=None, help="GPU id used for scratch warmup run.")
     parser.add_argument("--include-baselines", action="store_true", default=True)
     parser.add_argument(
+        "--only-policies",
+        type=str,
+        default="",
+        help="Comma-separated policy names to run (e.g. random,dapo_top). Empty means run all configured policies.",
+    )
+    parser.add_argument(
+        "--policy-gpu",
+        action="append",
+        default=[],
+        metavar="POLICY:GPU",
+        help="Pin a policy to a specific GPU id. Repeatable, e.g. --policy-gpu random:3",
+    )
+    parser.add_argument(
         "--gradient-keep-ratios",
         type=str,
         default="0.2,0.4,0.6,0.8,1.0",
@@ -238,7 +251,30 @@ def build_policy_specs(args: argparse.Namespace) -> list[PolicySpec]:
     dedup: dict[str, PolicySpec] = {}
     for spec in specs:
         dedup[spec.name] = spec
-    return list(dedup.values())
+    out = list(dedup.values())
+    if args.only_policies.strip():
+        requested = {x.strip() for x in args.only_policies.split(",") if x.strip()}
+        out = [spec for spec in out if spec.name in requested]
+        missing = sorted(requested - {spec.name for spec in out})
+        if missing:
+            raise ValueError(f"--only-policies requested unknown policy names: {missing}")
+    if not out:
+        raise ValueError("No policies selected to run.")
+    return out
+
+
+def parse_policy_gpu_map(items: list[str]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in items:
+        if ":" not in item:
+            raise ValueError(f"Invalid --policy-gpu entry: {item}. Expected POLICY:GPU")
+        name, gpu = item.split(":", 1)
+        name = name.strip()
+        gpu = gpu.strip()
+        if not name or not gpu:
+            raise ValueError(f"Invalid --policy-gpu entry: {item}. Expected POLICY:GPU")
+        mapping[name] = gpu
+    return mapping
 
 
 def launch_job(
@@ -468,10 +504,26 @@ def main() -> None:
 
     policies = build_policy_specs(args)
     gpu_ids = [x.strip() for x in args.gpu_ids.split(",") if x.strip()]
-    if len(policies) > len(gpu_ids):
-        raise ValueError(f"Need >= {len(policies)} GPUs for one-policy-per-GPU, got {len(gpu_ids)}")
     if not gpu_ids:
         raise ValueError("--gpu-ids must not be empty.")
+    policy_gpu_map = parse_policy_gpu_map(args.policy_gpu)
+    for policy_name, gpu in policy_gpu_map.items():
+        if policy_name not in {p.name for p in policies}:
+            raise ValueError(f"--policy-gpu references unknown policy '{policy_name}'")
+        if gpu not in gpu_ids:
+            raise ValueError(f"--policy-gpu uses gpu '{gpu}' not present in --gpu-ids={gpu_ids}")
+    auto_assign_policies = [p for p in policies if p.name not in policy_gpu_map]
+    used_gpus = set(policy_gpu_map.values())
+    free_gpus = [gpu for gpu in gpu_ids if gpu not in used_gpus]
+    if len(auto_assign_policies) > len(free_gpus):
+        raise ValueError(
+            f"Not enough GPUs after pinned assignments. "
+            f"Need {len(auto_assign_policies)} free GPUs, got {len(free_gpus)}."
+        )
+    policy_to_gpu: dict[str, str] = {}
+    policy_to_gpu.update(policy_gpu_map)
+    for idx, spec in enumerate(auto_assign_policies):
+        policy_to_gpu[spec.name] = free_gpus[idx]
 
     if args.mode == "continuation":
         assert args.start_from_path is not None
@@ -554,9 +606,9 @@ def main() -> None:
         run_cmd(profile_cmd, env=os.environ.copy(), log_path=args.run_root / "profile.log", dry_run=args.dry_run)
 
     jobs: list[dict[str, object]] = []
-    for idx, policy in enumerate(policies):
+    for policy in policies:
         if policy in periodic_gradient_policies:
-            gpu_id = gpu_ids[idx]
+            gpu_id = policy_to_gpu[policy.name]
             run_dir = args.run_root / "policies" / policy.name
             pid = launch_periodic_job(
                 args=args,
@@ -618,7 +670,7 @@ def main() -> None:
             dry_run=args.dry_run,
         )
 
-        gpu_id = gpu_ids[idx]
+        gpu_id = policy_to_gpu[policy.name]
         run_dir = args.run_root / "policies" / policy.name
         if args.policy_launch_mode == "continuation":
             pid = launch_job(

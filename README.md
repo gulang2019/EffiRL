@@ -88,6 +88,26 @@ Continuation from an existing checkpoint:
   --launcher-env USE_REMOVE_PADDING=false
 ```
 
+Run only specific policies / baselines (useful for retrying failed jobs):
+
+```bash
+./.venv_effirl/bin/python scripts/run_policy_grid_8gpu.py \
+  --run-root runs/policy_grid_retry_random \
+  --mode continuation \
+  --start-from-path <path_to_global_step_x> \
+  --only-policies random \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
+  --policy-gpu random:6 \
+  --policy-launch-mode continuation \
+  --gradient-update-mode static \
+  --launcher-env USE_REMOVE_PADDING=false
+```
+
+Flags:
+
+- `--only-policies`: comma-separated policy names to launch.
+- `--policy-gpu POLICY:GPU`: pin selected policies to specific GPU IDs.
+
 Scratch start (warmup first):
 
 ```bash
