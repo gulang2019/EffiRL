@@ -6,13 +6,21 @@ set -euo pipefail
 #
 # Usage:
 #   bash scripts/package_policy_grid_trace.sh runs/policy_grid_8gpu
-#   bash scripts/package_policy_grid_trace.sh runs/policy_grid_8gpu /tmp/policy_grid_trace.zip
+#   bash scripts/package_policy_grid_trace.sh runs/policy_grid_8gpu /tmp/policy_grid_trace.zip slim
+# Modes:
+#   slim (default): minimal debugging payload, excludes heavy rollout text artifacts
+#   full: richer payload including rollout CSV/analysis folders
 
 RUN_ROOT="${1:-runs/policy_grid_8gpu}"
 OUT_ZIP="${2:-${RUN_ROOT%/}_trace_$(date +%Y%m%d_%H%M%S).zip}"
+MODE="${3:-slim}"
 
 if [[ ! -d "${RUN_ROOT}" ]]; then
   echo "Run root not found: ${RUN_ROOT}" >&2
+  exit 1
+fi
+if [[ "${MODE}" != "slim" && "${MODE}" != "full" ]]; then
+  echo "Invalid mode: ${MODE}. Expected 'slim' or 'full'." >&2
   exit 1
 fi
 
@@ -35,8 +43,26 @@ copy_if_exists() {
 copy_if_exists "${RUN_ROOT}/policy_grid_manifest.json" "${STAGE}/${RUN_ROOT}/policy_grid_manifest.json"
 copy_if_exists "${RUN_ROOT}/profile.log" "${STAGE}/${RUN_ROOT}/profile.log"
 copy_if_exists "${RUN_ROOT}/progress" "${STAGE}/${RUN_ROOT}/progress"
-copy_if_exists "${RUN_ROOT}/analysis" "${STAGE}/${RUN_ROOT}/analysis"
-copy_if_exists "${RUN_ROOT}/profile" "${STAGE}/${RUN_ROOT}/profile"
+if [[ "${MODE}" == "full" ]]; then
+  copy_if_exists "${RUN_ROOT}/analysis" "${STAGE}/${RUN_ROOT}/analysis"
+  copy_if_exists "${RUN_ROOT}/profile" "${STAGE}/${RUN_ROOT}/profile"
+else
+  # Keep only compact profile summaries in slim mode.
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    dst="${STAGE}/${rel}"
+    mkdir -p "$(dirname "${dst}")"
+    cp "${f}" "${dst}"
+  done < <(
+    find . -type f \
+      \( -path "./${RUN_ROOT}/profile/checkpoint_summaries.json" \
+      -o -path "./${RUN_ROOT}/profile/split_manifest.json" \
+      -o -path "./${RUN_ROOT}/analysis/per_run_specs.json" \
+      -o -path "./${RUN_ROOT}/analysis/per_run_delta.csv" \
+      -o -path "./${RUN_ROOT}/analysis/family_delta_summary.csv" \) \
+      -print0 2>/dev/null
+  )
+fi
 copy_if_exists "${RUN_ROOT}/selector_pools" "${STAGE}/${RUN_ROOT}/selector_pools"
 
 # Per-policy logs/manifests (without checkpoints)
@@ -52,10 +78,24 @@ done < <(
     -o -path "./${RUN_ROOT}/policies/*/periodic_gradient_selector_manifest.json" \
     -o -path "./${RUN_ROOT}/policies/*/periodic/*.log" \
     -o -path "./${RUN_ROOT}/policies/*/periodic/**/*.log" \
-    -o -path "./${RUN_ROOT}/policies/*/periodic/**/*.json" \
-    -o -path "./${RUN_ROOT}/policies/*/periodic/**/*.csv" \) \
+    -o -path "./${RUN_ROOT}/policies/*/periodic/**/*.json" \) \
     -print0 2>/dev/null
 )
+
+if [[ "${MODE}" == "full" ]]; then
+  while IFS= read -r -d '' f; do
+    rel="${f#./}"
+    dst="${STAGE}/${rel}"
+    mkdir -p "$(dirname "${dst}")"
+    cp "${f}" "${dst}"
+  done < <(
+    find . -type f \
+      \( -path "./${RUN_ROOT}/policies/*/periodic/**/*.csv" \
+      -o -path "./${RUN_ROOT}/analysis/**/*.csv" \
+      -o -path "./${RUN_ROOT}/analysis/**/*.json" \) \
+      -print0 2>/dev/null
+  )
+fi
 
 # Helpful repo context for reproducing parsing/analysis
 mkdir -p "${STAGE}/scripts"
@@ -95,3 +135,4 @@ mkdir -p "${OUT_DIR}"
 echo "Wrote trace archive: ${OUT_ZIP}"
 echo "Archive size:"
 ls -lh "${OUT_ZIP}"
+echo "Mode: ${MODE}"
